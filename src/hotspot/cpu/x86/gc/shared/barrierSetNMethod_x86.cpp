@@ -139,6 +139,14 @@ void BarrierSetNMethod::deoptimize(nmethod* nm, address* return_address_ptr) {
   assert(nm->frame_size() >= 3, "invariant");
   assert(*cookie == (address) -1, "invariant");
 
+  if (nm->is_compiled_by_c1() && nm->method()->has_scalarized_args()) {
+    // We can't deoptimize in the entry points of a C1 compiled method.
+    // Set the original pc such that code emitted by LIRGenerator::do_Base will detect the pending deoptimization.
+    address* unextended_sp = return_address_ptr + 1;
+    address* orig_pc_addr = (address*)((address)unextended_sp + nm->orig_pc_offset());
+    *orig_pc_addr = *return_address_ptr;
+    return;
+  }
   // Preserve caller rbp.
   *stub_rbp = *callers_rbp;
 

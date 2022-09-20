@@ -177,6 +177,12 @@ int BarrierSetNMethod::nmethod_stub_entry_barrier(address* return_address_ptr) {
   }
 
   if (!may_enter) {
+    if (nm->is_compiled_by_c1() && nm->method()->has_scalarized_args()) {
+      // We can't deoptimize in the entry points of a C1 compiled method.
+      // BarrierSetNMethod::deoptimize will delay deoptimization until we enter the method body (the check
+      // added in LIRGenerator::do_Base will detect the pending deoptimization by checking the original_pc).
+      may_enter = true;
+    }
     log_trace(nmethod, barrier)("Deoptimizing nmethod: " PTR_FORMAT, p2i(nm));
     bs_nm->deoptimize(nm, return_address_ptr);
   }
