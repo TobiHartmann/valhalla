@@ -126,7 +126,10 @@ public:
   void store_flat(GraphKit* kit, Node* base, Node* ptr, ciInstanceKlass* holder = nullptr, int holder_offset = 0, DecoratorSet decorators = IN_HEAP | MO_UNORDERED) const;
   // Store the field values to memory
   void store(GraphKit* kit, Node* base, Node* ptr, ciInstanceKlass* holder, int holder_offset = 0, DecoratorSet decorators = IN_HEAP | MO_UNORDERED) const;
+  Node* convert_to_long(GraphKit* kit, Node* long_value, int& long_shift) const;
+  void convert_from_long(GraphKit* kit, Node* long_value, int& long_shift);
   // Initialize the inline type by loading its field values from memory
+  void load_flat(GraphKit* kit, Node* base, Node* ptr, ciInstanceKlass* holder, GrowableArray<ciType*>& visited, int holder_offset = 0, DecoratorSet decorators = IN_HEAP | MO_UNORDERED);
   void load(GraphKit* kit, Node* base, Node* ptr, ciInstanceKlass* holder, GrowableArray<ciType*>& visited, int holder_offset = 0, DecoratorSet decorators = IN_HEAP | MO_UNORDERED);
   // Make sure that inline type is fully scalarized
   InlineTypeNode* adjust_scalarization_depth(GraphKit* kit);

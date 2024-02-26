@@ -28,6 +28,7 @@
 #include "gc/shared/gc_globals.hpp"
 #include "opto/addnode.hpp"
 #include "opto/castnode.hpp"
+#include "opto/convertnode.hpp"
 #include "opto/graphKit.hpp"
 #include "opto/inlinetypenode.hpp"
 #include "opto/rootnode.hpp"
@@ -494,7 +495,90 @@ void InlineTypeNode::store_flat(GraphKit* kit, Node* base, Node* ptr, ciInstance
     holder = inline_klass();
   }
   holder_offset -= inline_klass()->first_field_offset();
-  store(kit, base, ptr, holder, holder_offset, decorators);
+  if (true) {
+    // TODO verify that types are integral types
+  /*
+  int first_offset = field_offset(0);
+  int last_offset = field_offset(field_count() - 1);
+  int total_size = (last_offset - first_offset) + inline_klass()->declared_nonstatic_field_at(field_count() - 1)->size_in_bytes();
+  tty->print_cr("%d %d %d", first_offset, last_offset, total_size);
+  */
+    // We can write all fields at once with an 8-byte store
+    // TODO should we convert to int first and then combine ints to a long?
+    int lshift = 0;
+    Node* long_value = convert_to_long(kit, kit->longcon(0), lshift);
+    int offset = holder_offset + field_offset(0);
+    decorators |= C2_MISMATCHED;
+    // TODO check this
+    decorators |= C2_UNSAFE_ACCESS;
+    const TypePtr* adr_type = field_adr_type(base, offset, holder, decorators, kit->gvn());
+    Node* adr = kit->basic_plus_adr(base, ptr, offset);
+    const Type* val_type = Type::get_const_basic_type(T_LONG);
+    bool is_array = (kit->gvn().type(base)->isa_aryptr() != nullptr);
+    kit->access_store_at(base, adr, adr_type, long_value, val_type, T_LONG, is_array ? (decorators | IS_ARRAY) : decorators);
+  } else {
+    store(kit, base, ptr, holder, holder_offset, decorators);
+  }
+}
+
+/// TODO make private
+Node* InlineTypeNode::convert_to_long(GraphKit* kit, Node* long_value, int& long_shift) const {
+  for (uint i = 0; i < field_count(); ++i) {
+    Node* value = field_value(i);
+    if (field_is_flat(i)) {
+      long_value = value->as_InlineType()->convert_to_long(kit, long_value, long_shift);
+    } else {
+      ciField* field = inline_klass()->declared_nonstatic_field_at(i);
+      BasicType bt = field->type()->basic_type();
+      if (bt == T_BYTE || bt == T_BOOLEAN) {
+        value = kit->gvn().transform(new AndINode(value, kit->intcon(0xFF)));
+      } else if (bt == T_CHAR || bt == T_SHORT) {
+        value = kit->gvn().transform(new AndINode(value, kit->intcon(0xFFFF)));
+      }
+      // Convert to long and remove the sign bit (the backend will fold this and emit a zero extend i2l)
+      value = kit->gvn().transform(new ConvI2LNode(value));
+      value = kit->gvn().transform(new AndLNode(value, kit->longcon(0xFFFFFFFF)));
+
+      // Shift to the right position in the long value
+      Node* shift = kit->gvn().transform(new LShiftLNode(value, kit->intcon(long_shift)));
+      long_value = kit->gvn().transform(new OrLNode(shift, long_value));
+      long_shift += (field->size_in_bytes() * BitsPerByte);
+      assert(long_shift <= 64, "inline type does not fit into a long value");
+    }
+  }
+  return long_value;
+}
+
+void InlineTypeNode::convert_from_long(GraphKit* kit, Node* long_value, int& long_shift) {
+// TODO Check that there a no non-flat inline type fields (in fact, no oop fields). That also prevents circularity. Same for storing.
+  for (uint i = 0; i < field_count(); ++i) {
+    Node* value = nullptr;
+    if (field_is_flat(i)) {
+      ciType* ft = field_type(i);
+      InlineTypeNode* vt = make_uninitialized(kit->gvn(), ft->as_inline_klass());
+      vt->convert_from_long(kit, long_value, long_shift);
+      value = kit->gvn().transform(vt);
+    } else {
+      ciField* field = inline_klass()->declared_nonstatic_field_at(i);
+
+      // Shift to the right position in the long value
+      value = kit->gvn().transform(new RShiftLNode(long_value, kit->intcon(long_shift)));
+
+      // Convert to int and remove the garbage bits
+      // TODO this seems to ignore the sign bit of the long which is what we want, double check
+      value = kit->gvn().transform(new ConvL2INode(value));
+
+      BasicType bt = field->type()->basic_type();
+      if (bt == T_BYTE || bt == T_BOOLEAN) {
+        value = kit->gvn().transform(new AndINode(value, kit->intcon(0xFF)));
+      } else if (bt == T_CHAR || bt == T_SHORT) {
+        value = kit->gvn().transform(new AndINode(value, kit->intcon(0xFFFF)));
+      }
+      long_shift += (field->size_in_bytes() * BitsPerByte);
+      assert(long_shift <= 64, "inline type does not fit into a long value");
+    }
+    set_field_value(i, value);
+  }
 }
 
 void InlineTypeNode::store(GraphKit* kit, Node* base, Node* ptr, ciInstanceKlass* holder, int holder_offset, DecoratorSet decorators) const {
@@ -912,7 +996,33 @@ InlineTypeNode* InlineTypeNode::make_from_oop_impl(GraphKit* kit, Node* oop, ciI
 InlineTypeNode* InlineTypeNode::make_from_flat(GraphKit* kit, ciInlineKlass* vk, Node* obj, Node* ptr, ciInstanceKlass* holder, int holder_offset, DecoratorSet decorators) {
   GrowableArray<ciType*> visited;
   visited.push(vk);
-  return make_from_flat_impl(kit, vk, obj, ptr, holder, holder_offset, decorators, visited);
+
+  if (true) {
+    InlineTypeNode* vt = make_uninitialized(kit->gvn(), vk);
+    vt->load_flat(kit, obj, ptr, holder, visited, holder_offset, decorators);
+    return kit->gvn().transform(vt)->as_InlineType();
+  } else {
+    return make_from_flat_impl(kit, vk, obj, ptr, holder, holder_offset, decorators, visited);
+  }
+}
+
+void InlineTypeNode::load_flat(GraphKit* kit, Node* base, Node* ptr, ciInstanceKlass* holder, GrowableArray<ciType*>& visited, int holder_offset, DecoratorSet decorators) {
+  // The inline type is flattened into the object without an oop header. Subtract the
+  // offset of the first field to account for the missing header when loading the values.
+  holder_offset -= inline_klass()->first_field_offset();
+
+  int offset = holder_offset + field_offset(0);
+  decorators |= C2_MISMATCHED;
+  // TODO check this
+  decorators |= C2_UNSAFE_ACCESS;
+  const TypePtr* adr_type = field_adr_type(base, offset, holder, decorators, kit->gvn());
+  Node* adr = kit->basic_plus_adr(base, ptr, offset);
+  const Type* val_type = Type::get_const_basic_type(T_LONG);
+  bool is_array = (kit->gvn().type(base)->isa_aryptr() != nullptr);
+  Node* long_value = kit->access_load_at(base, adr, adr_type, val_type, T_LONG, is_array ? (decorators | IS_ARRAY) : decorators);
+
+  int long_shift = 0;
+  convert_from_long(kit, long_value, long_shift);
 }
 
 // GraphKit wrapper for the 'make_from_flat' method
