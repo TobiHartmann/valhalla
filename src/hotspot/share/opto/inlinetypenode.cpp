@@ -1014,6 +1014,7 @@ void InlineTypeNode::load_flat(GraphKit* kit, Node* base, Node* ptr, ciInstanceK
   int offset = holder_offset + field_offset(0);
   decorators |= C2_MISMATCHED;
   // TODO check this
+  // TODO an atomic load following an atomic store is not folded because C2_UNSAFE_ACCESS adds a barrier
   decorators |= C2_UNSAFE_ACCESS;
   const TypePtr* adr_type = field_adr_type(base, offset, holder, decorators, kit->gvn());
   Node* adr = kit->basic_plus_adr(base, ptr, offset);
