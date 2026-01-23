@@ -94,6 +94,7 @@ class InlineKlass: public InstanceKlass {
     int _nullable_size_in_bytes;   // size and alignment requirement for a nullable layout (always atomic), -1 if no nullable flat layout is possible
     int _null_marker_offset;       // expressed as an offset from the beginning of the object for a heap buffered value
                                    // payload_offset must be subtracted to get the offset from the beginning of the payload
+    int _fast_hash;
 
     Members();
   };
@@ -181,6 +182,9 @@ class InlineKlass: public InstanceKlass {
   int null_marker_offset() const                              { return members()._null_marker_offset; }
   void set_null_marker_offset(int offset)                     { members()._null_marker_offset = offset; }
   int null_marker_offset_in_payload() const                   { return null_marker_offset() - payload_offset(); }
+
+  int fast_hash() const                                       { return members()._fast_hash; }
+  void set_fast_hash(int fast_hash)                           { members()._fast_hash = fast_hash; }
 
   jbyte* null_marker_address(address payload) {
     assert(has_nullable_atomic_layout(), " Must have");
@@ -297,6 +301,10 @@ class InlineKlass: public InstanceKlass {
 
   static ByteSize null_marker_offset_offset() {
     return byte_offset_of(Members, _null_marker_offset);
+  }
+
+  static ByteSize fast_hash_offset() {
+    return byte_offset_of(Members, _fast_hash);
   }
 
   oop null_reset_value();

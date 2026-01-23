@@ -156,3 +156,14 @@ char* ciInstance::java_lang_String_str(char* buf, size_t buflen) {
   assert(get_oop()->is_a(vmClasses::String_klass()), "not a String");
   return java_lang_String::as_utf8_string(get_oop(), buf, buflen);
 }
+
+jint ciInstance::salted_identity_hash() const {
+  ciField* SALT_field = ciEnv::_ValueObjectMethods_klass->get_field_by_name(ciSymbol::make("SALT"),
+                                                                            ciSymbol::make("I"),
+                                                                            true);
+  assert(SALT_field != nullptr, "field not found");
+  ciConstant SALT = SALT_field->constant_value();
+
+  VM_ENTRY_MARK;
+  return (SALT.as_int() * 31) + get_oop()->identity_hash();
+}

@@ -775,21 +775,37 @@ JVM_ENTRY(jint, JVM_IHashCode(JNIEnv* env, jobject handle))
   }
   oop obj = JNIHandles::resolve_non_null(handle);
   if (Arguments::is_valhalla_enabled() && obj->klass()->is_inline_klass()) {
-      JavaValue result(T_INT);
-      JavaCallArguments args;
-      Handle ho(THREAD, obj);
-      args.push_oop(ho);
-      methodHandle method(THREAD, UseAltSubstitutabilityMethod
-              ? Universe::value_object_hash_codeAlt_method() : Universe::value_object_hash_code_method());
-      JavaCalls::call(&result, method, &args, THREAD);
-      if (HAS_PENDING_EXCEPTION) {
-        if (!PENDING_EXCEPTION->is_a(vmClasses::Error_klass())) {
-          Handle e(THREAD, PENDING_EXCEPTION);
-          CLEAR_PENDING_EXCEPTION;
-          THROW_MSG_CAUSE_(vmSymbols::java_lang_InternalError(), "Internal error in hashCode", e, false);
-        }
+    // Check if mark word contains hash code already
+    intptr_t hash = obj->mark().hash();
+    if (hash != 0) {
+      //tty->print_cr("HASH CACHED %d", checked_cast<jint>(hash));
+      return checked_cast<jint>(hash);
+    }
+
+    // Compute hash by calling ValueObjectMethods.valueObjectHashCode
+    JavaValue result(T_INT);
+    JavaCallArguments args;
+    Handle ho(THREAD, obj);
+    args.push_oop(ho);
+    methodHandle method(THREAD, UseAltSubstitutabilityMethod
+            ? Universe::value_object_hash_codeAlt_method() : Universe::value_object_hash_code_method());
+    JavaCalls::call(&result, method, &args, THREAD);
+    if (HAS_PENDING_EXCEPTION) {
+      if (!PENDING_EXCEPTION->is_a(vmClasses::Error_klass())) {
+        Handle e(THREAD, PENDING_EXCEPTION);
+        CLEAR_PENDING_EXCEPTION;
+        THROW_MSG_CAUSE_(vmSymbols::java_lang_InternalError(), "Internal error in hashCode", e, false);
       }
-      return result.get_jint();
+    }
+
+    hash = result.get_jint() & markWord::hash_mask;
+   // tty->print_cr("HASH %d %d", result.get_jint(), checked_cast<jint>(hash));
+
+    // Store hash in the mark word
+    markWord mark = ho->mark().copy_set_hash(hash);
+    ho->set_mark(mark);
+
+    return checked_cast<jint>(hash);
   } else {
     return checked_cast<jint>(ObjectSynchronizer::FastHashCode(THREAD, obj));
   }

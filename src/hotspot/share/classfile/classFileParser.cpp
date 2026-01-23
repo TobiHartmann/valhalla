@@ -5521,6 +5521,47 @@ void ClassFileParser::fill_instance_klass(InstanceKlass* ik,
     vk->set_null_marker_offset(_layout_info->_null_marker_offset);
     vk->set_null_reset_value_offset(_layout_info->_null_reset_value_offset);
     if (_layout_info->_is_empty_inline_klass) vk->set_is_empty_inline_type();
+
+    // TODO this does not work anymore?
+    //BasicType bt = vmClasses::box_klass_type(vk);
+    //if (is_java_primitive(bt) && bt != T_LONG && bt != T_DOUBLE) {
+
+    BasicType bt = T_ILLEGAL;
+    bool doIt = false;
+    for (int i = 0; i < vk->total_fields_count(); ++i) {
+      fieldDescriptor fd(vk, i);
+      if (fd.is_static()) continue;
+      bt = fd.field_type();
+      if (!is_java_primitive(bt) || doIt) {
+        // Not primitive or already primitive field found
+        doIt = false;
+        break;
+      } else {
+        doIt = true;
+      }
+    }
+
+    if (doIt) {
+      //  max offset is +16, i.e.   10000
+      //  shift in bits | adjusted offset
+      // We are reading an int = 4 bytes but are only interested in payload size byte (without null marker byte)
+//      int shift_in_bytes = 4 - (_layout_info->_payload_size_in_bytes - 1);
+      int shift_in_bytes = 8 - type2aelembytes(bt);
+      int shift_in_bits = shift_in_bytes*8;
+      int adjusted_offset = _layout_info->_payload_offset - shift_in_bytes;
+      // TODO I think this can happen with COH, right?
+      // _layout_info->_payload_size_in_bytes
+      assert(adjusted_offset >= 0, "Reading out of bounds: %d", adjusted_offset);
+      // TODO also check that we are not reading beyond
+
+      int val = shift_in_bits << 5;
+      val = val | adjusted_offset;
+
+      assert((val & 0x1f) == adjusted_offset, "sanity1"); // 0xb11111
+      assert((val >> 5) == shift_in_bits, "sanity1");
+      vk->set_fast_hash(val);
+    }
+
     vk->initialize_calling_convention(CHECK);
   }
 

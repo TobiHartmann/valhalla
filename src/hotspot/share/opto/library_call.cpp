@@ -4907,7 +4907,7 @@ bool LibraryCallKit::inline_newArray(bool null_free, bool atomic) {
   const TypeInstPtr* tp = _gvn.type(componentType)->isa_instptr();
   if (tp != nullptr) {
     ciInstanceKlass* ik = tp->instance_klass();
-    if (ik == C->env()->Class_klass()) {
+    if (ik == env()->Class_klass()) {
       ciType* t = tp->java_mirror_type();
       if (t != nullptr && t->is_inlinetype()) {
 
@@ -5444,7 +5444,7 @@ bool LibraryCallKit::inline_native_hashcode(bool is_virtual, bool is_static) {
   assert(is_static == callee()->is_static(), "correct intrinsic selection");
   assert(!(is_virtual && is_static), "either virtual, special, or static");
 
-  enum { _slow_path = 1, _fast_path, _null_path, PATH_LIMIT };
+  enum { _slow_path = 1, _fast_value_path, _fast_path, _null_path, PATH_LIMIT };
 
   RegionNode* result_reg = new RegionNode(PATH_LIMIT);
   PhiNode*    result_val = new PhiNode(result_reg, TypeInt::INT);
@@ -5452,10 +5452,41 @@ bool LibraryCallKit::inline_native_hashcode(bool is_virtual, bool is_static) {
   PhiNode*    result_mem = new PhiNode(result_reg, Type::MEMORY, TypePtr::BOTTOM);
   Node* obj = argument(0);
 
-  // Don't intrinsify hashcode on inline types for now.
   // The "is locked" runtime check also subsumes the inline type check (as inline types cannot be locked) and goes to the slow path.
   if (gvn().type(obj)->is_inlinetypeptr()) {
-    return false;
+    // TODO We should implement this similar to acmp by folding the slow runtime call if we know the exact type
+    // TODO but after parsing, we can't inline anymore .. and we probably don't want to "hardcode" stuff like _doubleToLongBits in IR, right?
+    // Crazy option: Pre-compute eagerly in IR during parsing?
+    // TODO we need to combine this with caching in the buffer ... I.e. if C2 knows type, compute? Or check cache? Otherwise, use cache.
+    // Can't we just put the hash somewhere else in the buffer? At least for now
+    // Often, re-computation will probably be as fast as loading from the buffer though ..
+    // Can we do something similar for acmp
+
+    jint type_hash = gvn().type(obj)->inline_klass()->java_mirror()->salted_identity_hash();
+    Node* hash = intcon(type_hash);
+
+    InlineTypeNode* vt = obj->as_InlineType();
+    for (uint i = 0; i < vt->field_count(); i++) {
+      Node* val = vt->field_value(i);
+      BasicType bt = vt->field_type(i)->basic_type();
+      ciMethod* hashCode_method = ciInstanceKlass::hashCode_method_for_type(bt);
+
+      push(val);
+
+      CallGenerator* cg = CallGenerator::for_inline(hashCode_method, 0);
+      dec_sp(1); // Temporarily pop args for JVM state of call
+      JVMState* jvms = sync_jvms();
+      JVMState* new_jvms = cg->generate(jvms);
+      assert(new_jvms != nullptr, "failed to inline");
+      add_exception_states_from(new_jvms);
+      set_jvms(new_jvms);
+
+      val = pop();
+      hash = _gvn.transform(new MulINode(hash, intcon(31)));
+      hash = _gvn.transform(new AddINode(hash, val));
+    }
+    set_result(hash);
+    return true;
   }
 
   if (!is_static) {
@@ -5480,6 +5511,10 @@ bool LibraryCallKit::inline_native_hashcode(bool is_virtual, bool is_static) {
       set_result(result_val->in(_null_path));
     return true;
   }
+
+  // TODO
+  RegionNode* fast_value_region = new RegionNode(1);
+  record_for_igvn(fast_value_region);
 
   // We only go to the fast case code if we pass a number of guards.  The
   // paths which do not pass are accumulated in the slow_region.
@@ -5507,8 +5542,6 @@ bool LibraryCallKit::inline_native_hashcode(bool is_virtual, bool is_static) {
 
   if (!UseObjectMonitorTable) {
     // Test the header to see if it is safe to read w.r.t. locking.
-    // We cannot use the inline type mask as this may check bits that are overriden
-    // by an object monitor's pointer when inflating locking.
     Node *lock_mask      = _gvn.MakeConX(markWord::lock_mask_in_place);
     Node *lmasked_header = _gvn.transform(new AndXNode(header, lock_mask));
     Node *monitor_val   = _gvn.MakeConX(markWord::monitor_value);
@@ -5536,7 +5569,10 @@ bool LibraryCallKit::inline_native_hashcode(bool is_virtual, bool is_static) {
   Node *chk_assigned   = _gvn.transform(new CmpINode( hash_val, no_hash_val));
   Node *test_assigned  = _gvn.transform(new BoolNode( chk_assigned, BoolTest::eq));
 
-  generate_slow_guard(test_assigned, slow_region);
+  RegionNode* no_hash_region = new RegionNode(1);
+  record_for_igvn(no_hash_region);
+
+  generate_slow_guard(test_assigned, no_hash_region);
 
   Node* init_mem = reset_memory();
   // fill in the rest of the null path:
@@ -5548,9 +5584,124 @@ bool LibraryCallKit::inline_native_hashcode(bool is_virtual, bool is_static) {
   result_io ->init_req(_fast_path, i_o());
   result_mem->init_req(_fast_path, init_mem);
 
+  // Generate code for the no_hash region
+  set_control(_gvn.transform(no_hash_region));
+  set_all_memory(init_mem);
+  generate_slow_guard(inline_type_test(obj), fast_value_region);
+  slow_region->add_req(control());
+
+  // Generate code for the fast value case
+  set_control(_gvn.transform(fast_value_region));
+  if (!stopped()) {
+    set_all_memory(init_mem);
+/*
+    Node* frame = _gvn.transform(new ParmNode(C->start(), TypeFunc::FramePtr));
+    Node* halt = _gvn.transform(new HaltNode(control(), frame, "Fast path called from C2!"));
+    C->root()->add_req(halt);
+
+    result_reg->init_req(_fast_value_path, top());
+    result_val->init_req(_fast_value_path, top());
+    result_io  ->set_req(_fast_value_path, top());
+    result_mem ->set_req(_fast_value_path, top());
+*/
+    /*
+     We do a (signed?) subword extract!
+
+     int adjusted_offset = fast_val & 0x1f;
+     int shift_in_bits = fast_val >>> 5;
+
+     long field_value = Unsafe.getLong(obj, adjusted_offset) >> shift_in_bits;
+     int low32 = (int)field_value;
+
+     int hash = low32 + SALT;
+
+     if (shift_in_bits == 0) {
+       int high32 = (int) (field_value >>> 32);
+       hash += high32;
+     }
+    */
+
+    Node* vk = load_object_klass(obj);
+
+    Node* members_addr = basic_plus_adr(vk, in_bytes(InlineKlass::adr_members_offset()));
+    Node* members = make_load(control(), members_addr, TypeRawPtr::BOTTOM, T_ADDRESS, MemNode::unordered);
+    Node* fast_val_addr = basic_plus_adr(members, in_bytes(InlineKlass::fast_hash_offset()));
+    Node* fast_val = make_load(control(), fast_val_addr, TypeInt::INT, T_INT, MemNode::unordered);
+
+    Node* adjusted_offset = _gvn.transform(new AndINode(fast_val, intcon(0x1f)));
+    adjusted_offset = _gvn.transform(new ConvI2LNode(adjusted_offset, TypeLong::INT));
+
+    Node* field_addr = basic_plus_adr(obj, adjusted_offset);
+    // TODO must be mismatched
+    Node* field_value = make_load(control(), field_addr, TypeLong::LONG, T_LONG, MemNode::unordered);
+
+    Node* shift_in_bits = _gvn.transform(new URShiftINode(fast_val, intcon(5)));
+    field_value = _gvn.transform(new RShiftLNode(field_value, shift_in_bits));
+
+    Node* low32 = _gvn.transform(new ConvL2INode(field_value));
+
+    ciField* SALT_field = env()->ValueObjectMethods_klass()->get_field_by_name(ciSymbol::make("SALT"), ciSymbol::make("I"), true);
+
+    assert(SALT_field != nullptr, "field not found");
+    Node* salt = make_constant_from_field(SALT_field, nullptr);
+    salt = _gvn.transform(new MulINode(intcon(31), salt));
+    Node* hash_value = _gvn.transform(new AddINode(low32, salt));
+
+    // The shift_in_bits tells us how many bits of the long read we are not interested in
+    // If it's 0, we need all bits, i.e., also the upper 32-bits
+    {
+      Node* cmp = _gvn.transform(new CmpINode(shift_in_bits, intcon(0)));
+      Node* bol = _gvn.transform(new BoolNode(cmp, BoolTest::eq));
+      IfNode* if_node = create_and_map_if(control(), bol, PROB_FAIR, COUNT_UNKNOWN);
+
+      RegionNode* region = new RegionNode(3);
+      PhiNode* phi = new PhiNode(region, TypeInt::INT);
+
+      Node* if_true = _gvn.transform(new IfTrueNode(if_node));
+      region->init_req(1, if_true);
+
+      Node* high32 = _gvn.transform(new URShiftLNode(field_value, intcon(32)));
+      high32 = _gvn.transform(new ConvL2INode(high32));
+      Node* new_hash_value = _gvn.transform(new MulINode(hash_value, intcon(31)));
+      new_hash_value = _gvn.transform(new AddINode(new_hash_value, high32));
+
+      phi->init_req(1, new_hash_value);
+
+      Node* if_false = _gvn.transform(new IfFalseNode(if_node));
+      region->init_req(2, if_false);
+      phi->init_req(2, hash_value);
+
+      set_control(_gvn.transform(region));
+      record_for_igvn(region);
+
+      hash_value = _gvn.transform(phi);
+    }
+
+    hash_value = _gvn.transform(new AndINode(hash_value, intcon(markWord::hash_mask)));
+
+    // TODO make sure to save hash
+
+    result_reg->init_req(_fast_value_path, control());
+    result_val->init_req(_fast_value_path, hash_value);
+    result_io  ->set_req(_fast_value_path, i_o());
+    result_mem ->set_req(_fast_value_path, reset_memory());
+  }
+
   // Generate code for the slow case.  We make a call to hashCode().
   set_control(_gvn.transform(slow_region));
   if (!stopped()) {
+    set_all_memory(init_mem);
+    /*
+    Node* frame = _gvn.transform(new ParmNode(C->start(), TypeFunc::FramePtr));
+    Node* halt = _gvn.transform(new HaltNode(control(), frame, "Slow path called from C2!"));
+    C->root()->add_req(halt);
+
+    result_reg->init_req(_slow_path, top());
+    result_val->init_req(_slow_path, top());
+    result_io  ->set_req(_slow_path, top());
+    result_mem ->set_req(_slow_path, top());
+    */
+
     // No need for PreserveJVMState, because we're using up the present state.
     set_all_memory(init_mem);
     vmIntrinsics::ID hashCode_id = is_static ? vmIntrinsics::_identityHashCode : vmIntrinsics::_hashCode;
