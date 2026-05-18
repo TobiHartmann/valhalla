@@ -50,6 +50,25 @@
 #include "utilities/pair.hpp"
 #include "utilities/tuple.hpp"
 
+static bool scalarization_depth_limit_reached(const GrowableArray<ciType*>& visited) {
+  return ScalarizationDepth > 0 && visited.length() >= ScalarizationDepth;
+}
+
+static bool should_scalarize_inline_type_field(Compile* C, ciField* field, GrowableArray<ciType*>& visited, bool allow_depth_limit = true) {
+  assert(field->type()->is_inlinetype(), "should only be used for inline type fields");
+  if (!field->is_flat()) {
+    if (visited.contains(field->type())) {
+      C->set_has_limited_inline_type_scalarization(true);
+      return false;
+    }
+    if (allow_depth_limit && scalarization_depth_limit_reached(visited)) {
+      C->set_has_limited_inline_type_scalarization(true);
+      return false;
+    }
+  }
+  return true;
+}
+
 // Clones the inline type to handle control flow merges involving multiple inline types.
 // The inputs are replaced by PhiNodes to represent the merged values for the given region.
 // init_with_top: input of phis above the returned InlineTypeNode are initialized to top.
@@ -90,13 +109,14 @@ InlineTypeNode* InlineTypeNode::clone_with_phis(PhaseGVN* gvn, Node* region, Saf
   for (uint i = 0; i < vt->field_count(); ++i) {
     ciType* type = vt->field(i)->type();
     Node*  value = vt->field_value(i);
-    // We limit scalarization for inline types with circular fields and can therefore observe nodes
-    // of the same type but with different scalarization depth during GVN. To avoid inconsistencies
-    // during merging, make sure that we only create Phis for fields that are guaranteed to be scalarized.
+    // Scalarization can be limited for inline types with circular fields or by ScalarizationDepth.
+    // We can therefore observe nodes of the same type but with different scalarization depth
+    // during GVN. To avoid inconsistencies during merging, make sure that we only create Phis
+    // for fields that are guaranteed to be scalarized.
     ciField* field = this->field(i);
     assert(!field->is_flat() || field->type()->is_inlinetype(), "must be an inline type");
-    bool no_circularity = !gvn->C->has_circular_inline_type() || field->is_flat();
-    if (type->is_inlinetype() && no_circularity) {
+    bool is_guaranteed_scalarized = !gvn->C->has_limited_inline_type_scalarization() || field->is_flat();
+    if (type->is_inlinetype() && is_guaranteed_scalarized) {
       // Handle inline type fields recursively
       value = value->as_InlineType()->clone_with_phis(gvn, region, map);
     } else {
@@ -397,11 +417,11 @@ void InlineTypeNode::make_scalar_in_safepoints(PhaseIterGVN* igvn, bool allow_oo
   }
 }
 
-// We limit scalarization for inline types with circular fields and can therefore observe nodes
-// of the same type but with different scalarization depth during GVN. This method adjusts the
-// scalarization depth to avoid inconsistencies during merging.
+// Scalarization can be limited for inline types with circular fields or by ScalarizationDepth.
+// We can therefore observe nodes of the same type but with different scalarization depth during
+// GVN. This method adjusts the scalarization depth to avoid inconsistencies during merging.
 InlineTypeNode* InlineTypeNode::adjust_scalarization_depth(GraphKit* kit) {
-  if (!kit->C->has_circular_inline_type()) {
+  if (!kit->C->has_limited_inline_type_scalarization()) {
     return this;
   }
   GrowableArray<ciType*> visited;
@@ -418,7 +438,7 @@ InlineTypeNode* InlineTypeNode::adjust_scalarization_depth_impl(GraphKit* kit, G
     ciType* ft = field->type();
     if (value->is_InlineType()) {
       assert(!field->is_flat() || field->type()->is_inlinetype(), "must be an inline type");
-      if (!field->is_flat() && visited.contains(ft)) {
+      if (!should_scalarize_inline_type_field(kit->C, field, visited)) {
         new_value = value->as_InlineType()->buffer(kit)->get_oop();
       } else {
         int old_len = visited.length();
@@ -426,7 +446,7 @@ InlineTypeNode* InlineTypeNode::adjust_scalarization_depth_impl(GraphKit* kit, G
         new_value = value->as_InlineType()->adjust_scalarization_depth_impl(kit, visited);
         visited.trunc_to(old_len);
       }
-    } else if (ft->is_inlinetype() && !visited.contains(ft)) {
+    } else if (ft->is_inlinetype() && should_scalarize_inline_type_field(kit->C, field, visited)) {
       int old_len = visited.length();
       visited.push(ft);
       new_value = make_from_oop_impl(kit, value, ft->as_inline_klass(), visited);
@@ -475,9 +495,7 @@ void InlineTypeNode::load(GraphKit* kit, Node* base, Node* ptr, bool immutable_m
       const TypePtr* field_ptr_type = (decorators & C2_MISMATCHED) == 0 ? kit->gvn().type(field_ptr)->is_ptr() : TypeRawPtr::BOTTOM;
       value = kit->access_load_at(base, field_ptr, field_ptr_type, val_type, bt, decorators);
       // Loading a non-flattened inline type from memory
-      if (visited.contains(ft)) {
-        kit->C->set_has_circular_inline_type(true);
-      } else if (ft->is_inlinetype()) {
+      if (ft->is_inlinetype() && should_scalarize_inline_type_field(kit->C, field, visited)) {
         int old_len = visited.length();
         visited.push(ft);
         value = make_from_oop_impl(kit, value, ft->as_inline_klass(), visited);
@@ -1306,9 +1324,9 @@ InlineTypeNode* InlineTypeNode::make_all_zero_impl(PhaseGVN& gvn, ciInlineKlass*
     assert(!field->is_flat() || field->type()->is_inlinetype(), "must be an inline type");
     ciType* ft = field->type();
     Node* value = gvn.zerocon(ft->basic_type());
-    if (!field->is_flat() && visited.contains(ft)) {
-      gvn.C->set_has_circular_inline_type(true);
-    } else if (ft->is_inlinetype()) {
+    bool allow_depth_limit = !field->is_null_free(); // Null-free fields need default value
+    if (ft->is_inlinetype() &&
+        should_scalarize_inline_type_field(gvn.C, field, visited, allow_depth_limit)) {
       int old_len = visited.length();
       visited.push(ft);
       ciInlineKlass* vk_field = ft->as_inline_klass();
@@ -1755,10 +1773,11 @@ void InlineTypeNode::initialize_fields(GraphKit* kit, MultiNode* multi, uint& ba
       // Non-flat inline type field
       if (type->is_inlinetype()) {
         if (null_check_region != nullptr) {
-          // We limit scalarization for inline types with circular fields and can therefore observe nodes
-          // of the same type but with different scalarization depth during GVN. To avoid inconsistencies
-          // during merging, make sure that we only create Phis for fields that are guaranteed to be scalarized.
-          if (parm->is_InlineType() && kit->C->has_circular_inline_type()) {
+          // Scalarization can be limited for inline types with circular fields or by ScalarizationDepth.
+          // We can therefore observe nodes of the same type but with different scalarization depth
+          // during GVN. To avoid inconsistencies during merging, make sure that we only create Phis
+          // for fields that are guaranteed to be scalarized.
+          if (parm->is_InlineType() && kit->C->has_limited_inline_type_scalarization()) {
             parm = parm->as_InlineType()->get_oop();
           }
           // Holder is nullable, set field to nullptr if holder is nullptr to avoid loading from uninitialized memory
@@ -1766,9 +1785,8 @@ void InlineTypeNode::initialize_fields(GraphKit* kit, MultiNode* multi, uint& ba
           parm->set_req(2, kit->zerocon(T_OBJECT));
           parm = gvn.transform(parm);
         }
-        if (visited.contains(type)) {
-          kit->C->set_has_circular_inline_type(true);
-        } else if (!parm->is_InlineType()) {
+        if (!parm->is_InlineType() &&
+            should_scalarize_inline_type_field(kit->C, field, visited)) {
           int old_len = visited.length();
           visited.push(type);
           parm = make_from_oop_impl(kit, parm, type->as_inline_klass(), visited);
@@ -1846,9 +1864,7 @@ InlineTypeNode* InlineTypeNode::make_null_impl(PhaseGVN& gvn, ciInlineKlass* vk,
     ciType* ft = field->type();
     Node* value = gvn.zerocon(ft->basic_type());
     assert(!field->is_flat() || field->type()->is_inlinetype(), "must be an inline type");
-    if (!field->is_flat() && visited.contains(ft)) {
-      gvn.C->set_has_circular_inline_type(true);
-    } else if (ft->is_inlinetype()) {
+    if (ft->is_inlinetype() && should_scalarize_inline_type_field(gvn.C, field, visited)) {
       int old_len = visited.length();
       visited.push(ft);
       value = make_null_impl(gvn, ft->as_inline_klass(), visited);

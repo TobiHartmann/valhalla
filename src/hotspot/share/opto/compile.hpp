@@ -348,7 +348,7 @@ class Compile : public Phase {
   bool                  _has_stringbuilder;     // True StringBuffers or StringBuilders are allocated
   bool                  _has_boxed_value;       // True if a boxed object is allocated
   bool                  _has_reserved_stack_access; // True if the method or an inlined method is annotated with ReservedStackAccess
-  bool                  _has_circular_inline_type; // True if method loads an inline type with a circular, non-flat field
+  bool                  _has_limited_inline_type_scalarization; // True if C2 does not fully scalarize inline type fields
   bool                  _needs_nm_slot;         // True if an extra stack slot is needed to hold the null marker at scalarized returns
   uint                  _max_vector_size;       // Maximum size of generated vectors
   bool                  _clear_upper_avx;       // Clear upper bits of ymm registers using vzeroupper
@@ -638,8 +638,8 @@ public:
   void          set_has_boxed_value(bool z)     { _has_boxed_value = z; }
   bool              has_reserved_stack_access() const { return _has_reserved_stack_access; }
   void          set_has_reserved_stack_access(bool z) { _has_reserved_stack_access = z; }
-  bool              has_circular_inline_type() const { return _has_circular_inline_type; }
-  void          set_has_circular_inline_type(bool z) { _has_circular_inline_type = z; }
+  bool              has_limited_inline_type_scalarization() const { return _has_limited_inline_type_scalarization; }
+  void          set_has_limited_inline_type_scalarization(bool z) { _has_limited_inline_type_scalarization = z; }
   uint              max_vector_size() const     { return _max_vector_size; }
   void          set_max_vector_size(uint s)     { _max_vector_size = s; }
   bool              clear_upper_avx() const     { return _clear_upper_avx; }

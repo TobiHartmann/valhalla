@@ -601,6 +601,11 @@
           "Number of fields in instance limit for scalar replacement")      \
           range(0, max_jint)                                                \
                                                                             \
+  product(intx, ScalarizationDepth, 12,                                     \
+          "Maximum depth for scalarizing inline type fields in C2. "        \
+          "A value of 0 disables the limit.")                               \
+          range(0, max_jint)                                                \
+                                                                            \
   product(bool, OptimizePtrCompare, true,                                   \
           "Use escape analysis to optimize pointers compare")               \
                                                                             \

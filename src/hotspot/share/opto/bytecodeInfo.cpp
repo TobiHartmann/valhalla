@@ -437,6 +437,14 @@ bool InlineTree::try_to_inline(ciMethod* callee_method, ciMethod* caller_method,
       should_delay = true;
     }
   }
+  if (ScalarizationDepth > 0 &&
+      callee_method->holder()->is_inlinetype() &&
+      callee_method->is_object_constructor() &&
+      inline_level() >= ScalarizationDepth) {
+    C->set_has_limited_inline_type_scalarization(true);
+    set_msg("value class constructor scalarization is too deep");
+    return false;
+  }
 
   // detect direct and indirect recursive inlining
   {
