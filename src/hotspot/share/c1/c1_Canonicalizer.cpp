@@ -724,7 +724,8 @@ void Canonicalizer::do_If(If* x) {
     return;
   }
 
-  if (lt->is_constant() && rt->is_constant()) {
+  // Fix (1)
+  if (lt->is_constant() && rt->is_constant() && !x->substitutability_check()) {
     if (x->x()->as_Constant() != nullptr) {
       // pattern: If (lc cond rc) => simplify to: Goto
       BlockBegin* sux = x->x()->as_Constant()->compare(x->cond(), x->y(),
