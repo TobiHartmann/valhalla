@@ -24,7 +24,8 @@
 /*
  * @test
  * @bug 8386499
- * @summary Test C2 Unsafe.getFlatValue with a nullable non-atomic flat layout
+ * @summary Test C2 Unsafe.getFlatValue with a nullable non-atomic flat layout.
+ * @library /test/lib /
  * @requires vm.compiler2.enabled
  * @enablePreview
  * @modules java.base/jdk.internal.misc
@@ -40,57 +41,32 @@ package compiler.valhalla.inlinetypes;
 import java.lang.reflect.Field;
 
 import jdk.internal.misc.Unsafe;
+import jdk.test.lib.Asserts;
 
-public class TestGetFlatValueNullableNonAtomic {
+public value class TestGetFlatValueNullableNonAtomic {
     static final Unsafe U = Unsafe.getUnsafe();
-    static final Container CONTAINER = new Container(new Value(1, 2));
     static final long OFFSET;
     static final int LAYOUT;
 
     static {
         try {
-            Field f = Container.class.getDeclaredField("value");
+            Field f = TestGetFlatValueNullableNonAtomic.class.getDeclaredField("value");
             OFFSET = U.objectFieldOffset(f);
             LAYOUT = U.fieldLayout(f);
+            Asserts.assertEQ(LAYOUT, 5, "Unexpected layout");
         } catch (ReflectiveOperationException e) {
             throw new RuntimeException(e);
         }
     }
 
-    static value class Value {
-        int x;
-        int y;
+    Integer value = 42;
 
-        Value(int x, int y) {
-            this.x = x;
-            this.y = y;
-        }
-
-        int sum() {
-            return x + y;
-        }
-    }
-
-    static value class Container {
-        Value value;
-
-        Container(Value value) {
-            this.value = value;
-        }
-    }
-
-    static int test() {
-        Value v = U.getFlatValue(CONTAINER, OFFSET, LAYOUT, Value.class);
-        return v.sum();
+    int test() {
+        return U.getFlatValue(this, OFFSET, LAYOUT, Integer.class);
     }
 
     public static void main(String[] args) {
-        if (LAYOUT != 5) {
-            throw new AssertionError("expected nullable non-atomic flat layout 5, got " + LAYOUT);
-        }
-        int result = test();
-        if (result != 3) {
-            throw new AssertionError(result);
-        }
+        TestGetFlatValueNullableNonAtomic t = new TestGetFlatValueNullableNonAtomic();
+        Asserts.assertEQ(t.test(), 42);
     }
 }
